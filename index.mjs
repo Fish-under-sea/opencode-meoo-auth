@@ -158,7 +158,18 @@ async function tokenRequest(apiBaseUrl, params) {
   try {
     json = JSON.parse(text)
   } catch {}
-  if (!res.ok) throw new Error(`OAuth 换票失败 HTTP ${res.status}: ${json.error || text.slice(0, 160)}`)
+  if (!res.ok) {
+    const err = new Error(`OAuth 换票失败 HTTP ${res.status}: ${json.error || text.slice(0, 160)}`)
+    if (json.error) err.code = json.error
+    // invalid_grant 是 OAuth 的终态：refresh token 已被作废，重试也不会好。
+    // 宿主读到 signIn:"expired" 会把账号标为需要重新登录并停止退避重试，
+    // 否则它会照着 auth.refresh 的一次失败继续每分钟重试一个死的 token。
+    if (json.error === "invalid_grant" || (!json.error && res.status === 400 && /invalid_grant/.test(text))) {
+      err.signIn = "expired"
+      err.code = "invalid_grant"
+    }
+    throw err
+  }
   return json
 }
 
@@ -843,6 +854,12 @@ export const MeooAuthPlugin = async ({ client }) => {
     auth: {
       provider: PROVIDER_ID,
       refreshLead: LEAD_MS,
+      // Meoo 每次续期都换一个新的 refresh token，旧的立刻作废（实测 2026-11：
+      // 登录时的 c52cd8a49eb0 在一次自动续期后变成 049aaf11569b）。所以这个登录态
+      // 不能被复制到另一台机器或另一个进程去并行续期——两个主人抢一个一次性 token，
+      // 输的那个拿到 HTTP 400 invalid_grant，且无法自愈。宿主读到 rotating: true 就不
+      // 会把它带去同步或备份（magpie-community/plugins#884）。
+      rotating: true,
       async refresh(auth) {
         if (auth?.type !== "oauth" || !auth.refresh) return undefined
         const { a, didRenew } = await currentAuth(ctx, auth, true)

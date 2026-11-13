@@ -296,6 +296,26 @@ async function fetchIdentity(ctx, a) {
   return await controlRequest(ctx, a, "GET", "/open/v1/cli-compat/account/identity")
 }
 
+// 账号版本（identity.edition）当套餐名上报：宿主用 plan 给账号分组/折叠。
+// 身份接口不必每轮额度都问，缓存 10 分钟；失败就不给 plan，不拖垮额度读取。
+const IDENTITY_TTL = 10 * 60 * 1000
+const planCache = new Map()
+const EDITION_LABELS = { personal: "个人版", team: "团队版", enterprise: "企业版" }
+async function planOf(ctx, a) {
+  const key = `${apiBaseOf(a)}|${a.openid || a.userId || a.username || ""}`
+  const hit = planCache.get(key)
+  if (hit && Date.now() - hit.at < IDENTITY_TTL) return hit.plan
+  try {
+    const id = await fetchIdentity(ctx, a)
+    const edition = String(id?.edition || "").trim().toLowerCase()
+    const plan = EDITION_LABELS[edition] || edition
+    planCache.set(key, { at: Date.now(), plan })
+    return plan
+  } catch {
+    return ""
+  }
+}
+
 async function listProjects(ctx, a, limit = 50) {
   const data = await controlRequest(ctx, a, "GET", `/open/v1/cli-compat/projects?page_size=${limit}`)
   return data?.list || data?.items || data?.projects || (Array.isArray(data) ? data : [])
@@ -930,7 +950,13 @@ export const MeooAuthPlugin = async ({ client }) => {
           }
         }
         if (frozen > 0) windows.push({ name: "冻结", display: `${fmt(frozen)} 积分`, aside: true })
-        return { user: a.username || "", balance: `${fmt(left)} 积分`, windows }
+        const plan = await planOf(ctx, a)
+        return {
+          ...(plan ? { plan } : {}),
+          user: a.username || "",
+          balance: `${fmt(left)} 积分`,
+          windows,
+        }
       },
       async loader(getAuth) {
         const auth = await getAuth()

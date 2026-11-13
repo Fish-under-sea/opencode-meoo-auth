@@ -80,6 +80,8 @@ MEOO_EXTRA_MODELS=my-model-a,my-model-b
 
 每个窗口带 `runsOutAt` / `runsOut`：取该批次 `grantDetails` 里最早一个还有剩余的 `expiresDate` 与它的 `remainingAmount`，也就是 magpie 官方说的「剩余额度何时作废、作废多少」。积分没有重置周期，所以**不写 `resetsAt`**——那是「窗口重置/补满」的时间，Meoo 的积分只会到期作废，不会补回来。官方路由对没有重置时间的积分正是按 `runsOutAt` 排先后（smart 默认策略：剩余积分最早过期的账号排第一），写 `resetsAt` 反而会让路由误以为额度会重置。
 
+另外上报 `plan`：取身份接口的 `edition`（`personal` / `team` / `enterprise` → 个人版 / 团队版 / 企业版），宿主用它给账号分组和折叠。身份接口缓存 10 分钟，读失败就不带 `plan`，不影响额度。
+
 刻意**不再单独给一条「积分」钱包窗口**：卡片底部那行余额来自顶层 `balance`，多一条 balance 窗口只会在顶部重复一遍同样的数字。各来源的发放量之和就是 `totalGranted`，剩余之和就是 `availableBalance`，进度条与余额、面板合计三处对得上。接口没给批次明细时，退回一条聚合窗口，分母取**当前有效总量 = 剩余 + 已用 + 冻结**。手填项目服务 AK 的登录读不到积分账户，卡片会说明要用浏览器授权。
 
 ## 思考强度

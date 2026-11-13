@@ -635,9 +635,10 @@ test("usage：按赠送来源给出带进度条的数量窗口（不再重复一
     // 各来源总量之和 = 发放总量，剩余之和 = 账户余额
     assert.equal(sub.limit + login.limit + invite.limit, 12000)
     assert.equal(sub.amount + login.amount + invite.amount + 11228, 12000)
+    assert.equal(u.plan, "个人版")
     const call = mock.calls.find((c) => c.url.includes("/account/points"))
     assert.equal(call.init.headers.authorization, "Bearer acc-1")
-  }, [[/\/account\/points/, () => json(points)]])
+  }, [[/\/account\/points/, () => json(points)], [/\/account\/identity/, () => json({ data: { edition: "personal" } })]])
 })
 
 test("usage：runsOut 取最早作废那一笔的剩余量", async () => {

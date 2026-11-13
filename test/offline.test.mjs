@@ -583,7 +583,94 @@ test("refresh 钩子：oauth 账号续期并保留 AK/项目字段；api 账号�
 
 // ---- 余额（usage）-----------------------------------------------------------
 
-test("usage：积分按钱包窗口给出（余额/已用/最近到期）", async () => {
+test("usage：按赠送来源给出带进度条的数量窗口（不再重复一条钱包窗口）", async () => {
+  const { hooks } = await plugin(fakeClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, username: "Fishundersea",
+  }
+  const points = {
+    data: {
+      account: { availableBalance: 11228, frozenBalance: 0, totalGranted: 12000, totalConsumed: 772, totalExpired: 0 },
+      activeGrants: [
+        {
+          sourceType: "SUBSCRIPTION", sourceTypeName: "订阅赠送积分",
+          totalInitialAmount: 5000, totalRemainingAmount: 5000,
+          grantDetails: [{ remainingAmount: 5000, effectiveDate: "2026-11-13T00:00:00", expiresDate: "2026-12-13T00:00:00" }],
+        },
+        {
+          sourceType: "DAILY_LOGIN", sourceTypeName: "登录赠送积分",
+          totalInitialAmount: 2000, totalRemainingAmount: 1228,
+          grantDetails: [{ remainingAmount: 1228, effectiveDate: "2026-11-13T09:02:46.937", expiresDate: "2026-11-19T23:59:59" }],
+        },
+        {
+          sourceType: "INVITE_REWARD", sourceTypeName: "邀请奖励积分",
+          totalInitialAmount: 5000, totalRemainingAmount: 5000,
+          grantDetails: [{ remainingAmount: 5000, expiresDate: "2026-12-13T23:59:59" }],
+        },
+      ],
+    },
+  }
+  await withFetch(async (mock) => {
+    const u = await hooks.auth.usage(async () => auth)
+    assert.equal(u.user, "Fishundersea")
+    assert.equal(u.balance, "11,228 积分")
+    // 不再有「积分」钱包窗口：余额只由顶层 balance 显示一次
+    assert.equal(u.windows.length, 3)
+    assert.ok(u.windows.every((w) => w.name !== "积分" && w.balance === undefined))
+    // 每个赠送来源一条数量窗口：limit/amount/used 齐全，宿主才画进度条
+    const [sub, login, invite] = u.windows
+    assert.deepEqual(sub, {
+      name: "订阅赠送积分", used: 0, amount: 0, limit: 5000, unit: "积分",
+      display: "剩 5,000 / 5,000 积分", runsOutAt: "2026-12-13", runsOut: 5000,
+    })
+    assert.equal(login.name, "登录赠送积分")
+    assert.equal(login.amount, 772)
+    assert.equal(login.limit, 2000)
+    assert.equal(login.display, "剩 1,228 / 2,000 积分")
+    assert.ok(Math.abs(login.used - 38.6) < 1e-9)
+    assert.equal(login.runsOutAt, "2026-11-19")
+    assert.equal(login.runsOut, 1228)
+    assert.equal(invite.name, "邀请奖励积分")
+    // 各来源总量之和 = 发放总量，剩余之和 = 账户余额
+    assert.equal(sub.limit + login.limit + invite.limit, 12000)
+    assert.equal(sub.amount + login.amount + invite.amount + 11228, 12000)
+    const call = mock.calls.find((c) => c.url.includes("/account/points"))
+    assert.equal(call.init.headers.authorization, "Bearer acc-1")
+  }, [[/\/account\/points/, () => json(points)]])
+})
+
+test("usage：runsOut 取最早作废那一笔的剩余量", async () => {
+  const { hooks } = await plugin(fakeClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, username: "Fishundersea",
+  }
+  const points = {
+    data: {
+      account: { availableBalance: 1000, frozenBalance: 0, totalGranted: 1000, totalConsumed: 0 },
+      activeGrants: [
+        {
+          sourceType: "SUBSCRIPTION", sourceTypeName: "订阅赠送积分",
+          totalInitialAmount: 1000, totalRemainingAmount: 1000,
+          grantDetails: [
+            { remainingAmount: 300, expiresDate: "2026-11-20T00:00:00" },
+            { remainingAmount: 700, expiresDate: "2026-12-01T00:00:00" },
+          ],
+        },
+      ],
+    },
+  }
+  await withFetch(async () => {
+    const u = await hooks.auth.usage(async () => auth)
+    const row = u.windows[0]
+    assert.equal(row.runsOutAt, "2026-11-20")
+    assert.equal(row.runsOut, 300)
+    assert.equal(row.display, "剩 1,000 / 1,000 积分")
+  }, [[/\/account\/points/, () => json(points)]])
+})
+
+test("usage：没有批次明细时退回聚合用量窗口", async () => {
   const { hooks } = await plugin(fakeClient())
   const auth = {
     type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
@@ -592,28 +679,18 @@ test("usage：积分按钱包窗口给出（余额/已用/最近到期）", asyn
   const points = {
     data: {
       account: { availableBalance: 58848, frozenBalance: 0, totalGranted: 65000, totalConsumed: 2152 },
-      activeGrants: [
-        { grantDetails: [{ remainingAmount: 5000, expiresDate: "2026-12-02T23:59:59" }] },
-        {
-          grantDetails: [
-            { remainingAmount: 1933, expiresDate: "2026-11-10T23:59:59" },
-            { remainingAmount: 0, expiresDate: "2026-11-01T23:59:59" },
-          ],
-        },
-      ],
+      activeGrants: [],
     },
   }
-  await withFetch(async (mock) => {
+  await withFetch(async () => {
     const u = await hooks.auth.usage(async () => auth)
-    assert.equal(u.user, "Fishundersea")
-    assert.equal(u.balance, "58,848 积分")
-    // 钱包窗口：balance + unit（新宿主），同时带 display（旧宿主当纯文本窗口）
-    assert.deepEqual(u.windows[0], { name: "积分", balance: 58848, unit: "积分", display: "58,848 积分", runsOutAt: "2026-11-10" })
-    assert.equal(u.windows[1].name, "已用")
-    assert.equal(u.windows[1].display, "2,152 积分")
-    assert.equal(u.windows[1].aside, true)
-    const call = mock.calls.find((c) => c.url.includes("/account/points"))
-    assert.equal(call.init.headers.authorization, "Bearer acc-1")
+    assert.equal(u.windows.length, 1)
+    const bar = u.windows[0]
+    assert.equal(bar.name, "积分用量")
+    assert.equal(bar.amount, 2152)
+    assert.equal(bar.limit, 58848 + 2152)
+    assert.equal(bar.display, "2,152 / 61,000 积分")
+    assert.ok(Math.abs(bar.used - (2152 / 61000) * 100) < 1e-9)
   }, [[/\/account\/points/, () => json(points)]])
 })
 

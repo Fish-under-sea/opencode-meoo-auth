@@ -130,15 +130,19 @@ const int = (n, fallback = 0) => {
 }
 const vendorError = (json, text) => json?.detail || json?.message || String(text ?? "").slice(0, 160)
 
-/** 最近一批还没用完的积分的到期日（YYYY-MM-DD），给余额卡当提示。 */
+/**
+ * 最早作废的一笔积分：返回 { day: "YYYY-MM-DD", remaining }，没有则 null。
+ * 对应 magpie 的 runsOutAt / runsOut —— 路由在没有重置时间的积分上就按它排先后。
+ */
 function soonestLapse(grants) {
-  let best = ""
+  let best = null
   for (const g of Array.isArray(grants) ? grants : []) {
     for (const d of g?.grantDetails || []) {
-      if (int(d?.remainingAmount) <= 0) continue
+      const remaining = int(d?.remainingAmount)
+      if (remaining <= 0) continue
       const day = String(d?.expiresDate || "").slice(0, 10)
       if (!day) continue
-      if (!best || day < best) best = day
+      if (!best || day < best.day) best = { day, remaining }
     }
   }
   return best
@@ -857,9 +861,10 @@ export const MeooAuthPlugin = async ({ client }) => {
           ...(a.serviceAk ? { serviceAk: a.serviceAk, serviceAkProjectId: a.serviceAkProjectId, projectUrlId: a.projectUrlId, apiBase: a.apiBase } : {}),
         }
       },
-      // 余额：Meoo 的积分账户（控制面 /account/points）。预付费钱包按 magpie 的
-      // balance 窗口显示——这种窗口不写 used/limit，卡片显示数字而不是百分比条；
-      // 再补一条「已用」和最近一批到期日，免得只看得到余额看不到花在哪。
+      // 余额：Meoo 的积分账户（控制面 /account/points）。顶层 balance 就是卡片底部那行余额；
+      // activeGrants 里是每一批赠送积分（订阅/登录/邀请）的发放量与剩余量，
+      // 按来源各给一条 limit/amount/used 的数量窗口——分母是真实发放量，宿主才画进度条。
+      // 接口没给批次明细时退回一条聚合窗口（分母 = 当前有效总量 = 剩余 + 已用 + 冻结）。
       async usage(getAuth) {
         const auth = await getAuth()
         if (!auth) throw new Error("还没有连接 Meoo")
@@ -874,13 +879,56 @@ export const MeooAuthPlugin = async ({ client }) => {
         const used = int(acc.totalConsumed)
         const frozen = int(acc.frozenBalance)
         const fmt = (n) => new Intl.NumberFormat("en-US").format(n)
-        // 钱包窗口：新版 magpie 认 window.balance（不画百分比条、只显示数字）；
-        // 旧版会把它当纯文本窗口，所以同时给 display —— 两种宿主都能看到余额。
-        const wallet = { name: "积分", balance: left, unit: "积分", display: `${fmt(left)} 积分` }
-        const lapse = soonestLapse(data?.activeGrants)
-        if (lapse) wallet.runsOutAt = lapse
-        const windows = [wallet]
-        if (used > 0) windows.push({ name: "已用", display: `${fmt(used)} 积分`, aside: true })
+        // 不单独给「积分」钱包窗口：卡片的余额行已经用顶层 balance 显示同一个数，
+        // 再放一条 balance 窗口只会在顶部重复一遍「剩余 x 积分」。
+        const windows = []
+        // 每个赠送来源一行：limit=发放量、amount=已消耗（发放 - 剩余），
+        // 面板据此算「剩余 = limit - amount」，与钱包余额同源，不会自相矛盾。
+        for (const g of Array.isArray(data?.activeGrants) ? data.activeGrants : []) {
+          const initial = int(g?.totalInitialAmount)
+          if (initial <= 0) continue
+          const remain = Math.min(int(g?.totalRemainingAmount), initial)
+          const spent = initial - remain
+          const row = {
+            name: String(g?.sourceTypeName || g?.sourceType || "赠送积分"),
+            used: Math.max(0, Math.min(100, (spent / initial) * 100)),
+            amount: spent,
+            limit: initial,
+            unit: "积分",
+            display: `剩 ${fmt(remain)} / ${fmt(initial)} 积分`,
+            // 不是某条总额的拆分，而是独立的发放批次：不能标 aside，
+            // 额度面板会把 aside 窗口整个跳过（不进合计、也不画进度条）。
+          }
+          // runsOutAt/runsOut 是官方的「剩余额度何时作废、作废多少」：
+          // 积分没有重置周期，smart 路由就按最早作废时间给账号排先后。
+          const lapse = soonestLapse([g])
+          if (lapse) {
+            row.runsOutAt = lapse.day
+            row.runsOut = lapse.remaining
+          }
+          windows.push(row)
+        }
+        // 没有批次明细（或全是 0）时退回一条聚合窗口，免得卡片上只有余额没有条。
+        if (windows.length === 0) {
+          const total = left + used + frozen
+          if (total > 0) {
+            const pct = Math.max(0, Math.min(100, (used / total) * 100))
+            const agg = {
+              name: "积分用量",
+              used: pct,
+              amount: used,
+              limit: total,
+              unit: "积分",
+              display: `${fmt(used)} / ${fmt(total)} 积分`,
+            }
+            const lapse = soonestLapse(data?.activeGrants)
+            if (lapse) {
+              agg.runsOutAt = lapse.day
+              agg.runsOut = lapse.remaining
+            }
+            windows.push(agg)
+          }
+        }
         if (frozen > 0) windows.push({ name: "冻结", display: `${fmt(frozen)} 积分`, aside: true })
         return { user: a.username || "", balance: `${fmt(left)} 积分`, windows }
       },

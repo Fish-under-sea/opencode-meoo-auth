@@ -158,7 +158,18 @@ async function tokenRequest(apiBaseUrl, params) {
   try {
     json = JSON.parse(text)
   } catch {}
-  if (!res.ok) throw new Error(`OAuth 换票失败 HTTP ${res.status}: ${json.error || text.slice(0, 160)}`)
+  if (!res.ok) {
+    const err = new Error(`OAuth 换票失败 HTTP ${res.status}: ${json.error || text.slice(0, 160)}`)
+    if (json.error) err.code = json.error
+    // invalid_grant 是 OAuth 的终态：refresh token 已被作废，重试也不会好。
+    // 宿主读到 signIn:"expired" 会把账号标为需要重新登录并停止退避重试，
+    // 否则它会照着 auth.refresh 的一次失败继续每分钟重试一个死的 token。
+    if (json.error === "invalid_grant" || (!json.error && res.status === 400 && /invalid_grant/.test(text))) {
+      err.signIn = "expired"
+      err.code = "invalid_grant"
+    }
+    throw err
+  }
   return json
 }
 
@@ -186,6 +197,7 @@ async function renewToken(a, save) {
   const key = a.refresh
   const done = renewed.get(key)
   if (done && Date.now() - done.at < KEEP_RENEWED_MS) {
+    // 这一代已经在缓存里（换票时存过一次），把它存回宿主
     const merged = { ...a, ...done.next }
     await save?.(merged)
     return merged
@@ -194,15 +206,19 @@ async function renewToken(a, save) {
   if (!r) {
     r = (async () => {
       const next = await callRefreshApi(a)
+      // 存成功之后才放进缓存：Meoo 的 refresh token 每次续期都换新的，旧的立刻
+      // 作废，所以这一代 token 只有一份。存回宿主失败时（persistOf 会抛），若
+      // 这里已经缓存了它，60 秒后缓存过期，这一代就彻底丢了——下一次续期会带着
+      // 已经作废的旧 token，得到 invalid_grant，且看起来与"服务端吊销"一样。
+      await save?.({ ...a, ...next })
       renewed.set(key, { next, at: Date.now() })
       return next
     })().finally(() => renewing.delete(key))
     renewing.set(key, r)
   }
+  // 换票那一趟已经存过（上面）；走到这里的都是缓存里已有结果，那条路也存过。
   const next = await r
-  const merged = { ...a, ...next }
-  await save?.(merged)
-  return merged
+  return { ...a, ...next }
 }
 
 // Meoo 的 access token 过期时间是登录/续期时给的 expires_in，不是 JWT 声明；
@@ -386,7 +402,11 @@ async function serviceAkOf(ctx, a) {
   const urlId = await pickProject(ctx, a)
   if (a?.serviceAk && a.serviceAkProjectId === urlId) return a.serviceAk
   const { urlId: resolved, ak } = await resolveServiceAk(ctx, a, { projectUrlId: urlId })
-  await persistOf(ctx)({ ...a, projectUrlId: resolved, serviceAk: ak, serviceAkProjectId: resolved })
+  // 这里存的是 AK，不是换来的 token：存不住只是下次要再解析一次，AK 这一趟已经
+  // 拿到了，所以不让它把整个操作拖垮。token 那边的存不住是致命的，那边不吞。
+  try {
+    await persistOf(ctx)({ ...a, projectUrlId: resolved, serviceAk: ak, serviceAkProjectId: resolved })
+  } catch {}
   return ak
 }
 
@@ -798,11 +818,32 @@ function manualKeySignIn() {
 
 // ---- 插件出口 ---------------------------------------------------------------
 
+/**
+ * 把更新后的账号记录存回宿主。
+ *
+ * 存不回是致命的，不能吞掉：Meoo 的 refresh token 每次续期都换新的，旧的立刻
+ * 作废（实测 2026-11）。续期成功但没存回去，下一次就会带着已经作废的 token 去
+ * 换票，拿到 HTTP 400 invalid_grant，而这次失败看起来和"token 被服务端吊销"
+ * 一模一样，很难分辨。所以这里把失败报出去，让宿主和日志知道凭据没落盘。
+ *
+ * 宿主没有告诉插件"这个账号已经登出了"的办法（auth.set 在账号被登出时照样
+ * 返回成功），所以这里只能把写入本身抛出来的错误报出去：磁盘写不进去时宿主
+ * 会抛，那才是真正丢凭据的情况。账号被登出时宿主不抛，插件也就跟着不报错，
+ * 那是本来的结果。
+ */
 function persistOf(ctx) {
   return async (updated) => {
     try {
       await ctx?.client?.auth?.set?.({ path: { id: PROVIDER_ID }, body: updated })
-    } catch {}
+    } catch (e) {
+      const err = new Error(
+        `Meoo 登录态没能存回宿主（换到的凭据可能已经作废，请重新登录）：${e?.message ?? e}`,
+      )
+      err.cause = e
+      // 存不回凭据和凭据被拒一样，再试一次也没用
+      err.signIn = "expired"
+      throw err
+    }
   }
 }
 
@@ -843,6 +884,12 @@ export const MeooAuthPlugin = async ({ client }) => {
     auth: {
       provider: PROVIDER_ID,
       refreshLead: LEAD_MS,
+      // Meoo 每次续期都换一个新的 refresh token，旧的立刻作废（实测 2026-11：
+      // 登录时的 c52cd8a49eb0 在一次自动续期后变成 049aaf11569b）。所以这个登录态
+      // 不能被复制到另一台机器或另一个进程去并行续期——两个主人抢一个一次性 token，
+      // 输的那个拿到 HTTP 400 invalid_grant，且无法自愈。宿主读到 rotating: true 就不
+      // 会把它带去同步或备份（magpie-community/plugins#884）。
+      rotating: true,
       async refresh(auth) {
         if (auth?.type !== "oauth" || !auth.refresh) return undefined
         const { a, didRenew } = await currentAuth(ctx, auth, true)
@@ -936,8 +983,7 @@ export const _internal = {
   tokenRequest,
   renewToken,
   currentAuth,
-  isStale,
-  controlCall,
+  isStale,  controlCall,
   controlRequest,
   fetchIdentity,
   listProjects,

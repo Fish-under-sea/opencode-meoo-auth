@@ -12,6 +12,7 @@ const {
   pickProject,
   resolveServiceAk,
   currentAuth,
+  renewToken: renewTokenInternal,
   fetchGatewayModels,
   resetCatalogCache,
   configModels,
@@ -579,6 +580,142 @@ test("refresh 钩子：oauth 账号续期并保留 AK/项目字段；api 账号�
     assert.equal(next.apiBase, "https://meoo.test")
     assert.equal(client.saved.length, 1)
   }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+test("auth hook：声明 rotating（Meoo 每次续期都换新的 refresh token）", async () => {
+  // 实测 2026-11-11：登录时的 refresh token 指纹 c52cd8a49eb0，一次自动续期后
+  // 变成 049aaf11569b。旧的立刻作废，所以这个登录态不能被复制出去并行续期。
+  const { hooks } = await plugin()
+  assert.equal(hooks.auth.rotating, true)
+  assert.equal(typeof hooks.auth.refreshLead, "number")
+})
+
+test("refresh 钩子：invalid_grant 抛 signIn 'expired'，让宿主标记重新登录而不是无限重试", async () => {
+  // 报障场景：Meoo 对已作废的 refresh token 回 HTTP 400 invalid_grant。
+  // 宿主只有读到错误的 signIn:"expired" 才会把账号标为失效并停止退避重试。
+  const { hooks } = await plugin()
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-dead",
+    expires: Date.now() - 1000,
+  }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, "expired")
+      assert.equal(e.code, "invalid_grant")
+      assert.match(e.message, /invalid_grant/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400, headers: { "content-type": "application/json" } })]])
+})
+
+test("refresh 钩子：瞬时失败（非 invalid_grant）不标 expired，可退避重试", async () => {
+  const { hooks } = await plugin()
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-tmp",
+    expires: Date.now() - 1000,
+  }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, undefined)
+      assert.doesNotMatch(e.message, /invalid_grant/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => new Response("temporary", { status: 500 })]])
+})
+
+// ---- 存回宿主 ---------------------------------------------------------------
+
+/** 一个 auth.set 会失败的 client：模拟宿主写不进 plugin-auth.json。 */
+function failingClient(why = "disk full") {
+  return {
+    saved: [],
+    auth: {
+      async set() {
+        throw new Error(why)
+      },
+      async get() {
+        return { data: undefined }
+      },
+    },
+  }
+}
+
+test("续期后存不回宿主：报错并标记 expired，这一代 token 不留在缓存里", async () => {
+  // Meoo 的 refresh token 每次续期都换新的，旧的立刻作废。所以存回宿主失败时，
+  // 这一代 token 就只剩插件进程里的一份；一旦它过期丢掉，下一次续期会带着已经
+  // 作废的旧 token 去换票，得到 invalid_grant，看起来和服务端吊销一模一样。
+  const client = failingClient("no space left on device")
+  const { hooks } = await plugin(client)
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-nostore",
+    expires: Date.now() - 1000,
+  }
+  await withFetch(async (fetchMock) => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      // 存不回凭据要报出去，不能吞：宿主据此知道账号要重新登录
+      assert.equal(e.signIn, "expired")
+      assert.match(e.message, /没能存回宿主/)
+      assert.match(e.message, /no space left on device/)
+      return true
+    })
+    // 换票确实发生过（服务端那边新 token 已经作废了旧的）
+    assert.ok(fetchMock.calls.some((c) => c.url.endsWith("/oauth/token")))
+  }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+test("续期后存不回宿主：这一代 token 不进缓存，再续一次会重新换票", async () => {
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-nostore2",
+    expires: Date.now() - 1000,
+  }
+  await withFetch(async (fetchMock) => {
+    // 第一次：换票成功，但存不回宿主
+    await assert.rejects(() => renewTokenInternal(auth, async () => {
+      throw new Error("no space left on device")
+    }))
+    // 第二次（60 秒缓存期内）：如果没落盘的那一代被缓存了，这里会直接拿缓存、
+    // 不再换票，并假装成功。正确的行为是不信任它，重新走一次换票。
+    const saved = []
+    await renewTokenInternal(auth, async (merged) => {
+      saved.push(merged)
+    })
+    const tokenCalls = fetchMock.calls.filter((c) => c.url.endsWith("/oauth/token"))
+    assert.equal(tokenCalls.length, 2, "存不回宿主的那一代不能被缓存复用")
+    assert.equal(saved.length, 1)
+  }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+test("存回宿主成功：换到的 token 被记住并持久化", async () => {
+  const client = fakeClient()
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-ok",
+    expires: Date.now() - 1000,
+  }
+  await withFetch(async () => {
+    const next = await renewTokenInternal(auth, async (merged) => {
+      client.saved.push({ id: "meoo", body: merged })
+    })
+    assert.equal(next.access, "acc-1")
+    assert.equal(next.refresh, "ref-1")
+    assert.equal(client.saved.length, 1)
+    assert.equal(client.saved[0].body.refresh, "ref-1")
+  }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+test("解析出的 AK 存不回宿主时不拖垮这次操作（AK 已经在手上）", async () => {
+  const client = failingClient()
+  const { hooks } = await plugin(client)
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, projectUrlId: "proj-a",
+  }
+  await withFetch(async () => {
+    // AK 已经解析出来并能用，存不住只是下次要再解析一次，不该报错
+    const l = await hooks.auth.loader(async () => auth)
+    assert.equal(l.apiKey, "meoo_project_service_v1.env")
+  }, [
+    [/\/cloud\/environment/, () => json({ data: { meooProjectApiKey: "meoo_project_service_v1.env" } })],
+  ])
 })
 
 // ---- 余额（usage）-----------------------------------------------------------

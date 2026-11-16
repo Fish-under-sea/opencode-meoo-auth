@@ -19,6 +19,7 @@ const {
   browserSignIn,
   clientIdFor,
   isStale,
+  dailyLoginOf,
 } = _internal
 
 const GATEWAY = "https://gw.test/meoo/v1"
@@ -583,7 +584,18 @@ test("refresh 钩子：oauth 账号续期并保留 AK/项目字段；api 账号�
 
 // ---- 余额（usage）-----------------------------------------------------------
 
-test("usage：积分按钱包窗口给出（余额/已用/最近到期）", async () => {
+test("dailyLoginOf：按 typeCode/typeName 找权益；0 或缺失不算；-1 表示不限", () => {
+  assert.deepEqual(dailyLoginOf({ benefits: [{ typeCode: "daily_login", quota: 2000, unit: "积分" }] }), { quota: 2000, unit: "积分" })
+  assert.deepEqual(dailyLoginOf({ benefits: [{ typeName: "每日登录赠送积分", quota: 500 }] }), { quota: 500, unit: "积分" })
+  assert.deepEqual(dailyLoginOf({ benefits: [{ typeCode: "daily_login", quota: -1, unit: "点" }] }), { quota: -1, unit: "点" })
+  assert.equal(dailyLoginOf({ benefits: [{ typeCode: "daily_login", quota: 0 }] }), null)
+  assert.equal(dailyLoginOf({ benefits: [{ typeCode: "daily_login" }] }), null)
+  assert.equal(dailyLoginOf({ benefits: [{ typeCode: "supabase_count", quota: 1 }] }), null)
+  assert.equal(dailyLoginOf({}), null)
+  assert.equal(dailyLoginOf(null), null)
+})
+
+test("usage：积分按钱包窗口给出（余额/已用/最近到期），权益只读展示每日登录", async () => {
   const { hooks } = await plugin(fakeClient())
   const auth = {
     type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
@@ -603,6 +615,15 @@ test("usage：积分按钱包窗口给出（余额/已用/最近到期）", asyn
       ],
     },
   }
+  const entitlement = {
+    data: {
+      planCode: "free",
+      benefits: [
+        { typeCode: "daily_login", typeName: "每日登录赠送积分", valueType: "LIMIT", quota: 2000, used: 0, unit: "积分" },
+        { typeCode: "supabase_count", typeName: "云服务数量", quota: 1, used: 0 },
+      ],
+    },
+  }
   await withFetch(async (mock) => {
     const u = await hooks.auth.usage(async () => auth)
     assert.equal(u.user, "Fishundersea")
@@ -612,9 +633,69 @@ test("usage：积分按钱包窗口给出（余额/已用/最近到期）", asyn
     assert.equal(u.windows[1].name, "已用")
     assert.equal(u.windows[1].display, "2,152 积分")
     assert.equal(u.windows[1].aside, true)
+    // 每日登录是只读权益，不是用量；未带「今日已到账」标记时只显示额度
+    assert.deepEqual(u.windows.find((w) => w.name === "每日登录"), { name: "每日登录", display: "2,000 积分/日", aside: true })
     const call = mock.calls.find((c) => c.url.includes("/account/points"))
     assert.equal(call.init.headers.authorization, "Bearer acc-1")
-  }, [[/\/account\/points/, () => json(points)]])
+    const ent = mock.calls.find((c) => c.url.includes("/account/entitlement"))
+    assert.equal(ent.init.headers.authorization, "Bearer acc-1")
+  }, [[/\/account\/points/, () => json(points)], [/\/account\/entitlement/, () => json(entitlement)]])
+})
+
+test("usage：权益接口不可用时余额卡照常，不显示每日登录窗口", async () => {
+  const { hooks } = await plugin(fakeClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, username: "Fishundersea",
+  }
+  const points = { data: { account: { availableBalance: 1200, frozenBalance: 0, totalGranted: 1200, totalConsumed: 0 } } }
+  await withFetch(async () => {
+    const u = await hooks.auth.usage(async () => auth)
+    assert.equal(u.balance, "1,200 积分")
+    assert.equal(u.windows.find((w) => w.name === "每日登录"), undefined)
+  }, [[/\/account\/points/, () => json(points)], [/\/account\/entitlement/, () => new Response("denied", { status: 500 })]])
+})
+
+test("usage：权益里没有 daily_login 或配额不限时，只读窗口按实际显示", async () => {
+  const { hooks } = await plugin(fakeClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, username: "Fishundersea",
+  }
+  const points = { data: { account: { availableBalance: 800, frozenBalance: 0 } } }
+
+  await withFetch(async () => {
+    const u = await hooks.auth.usage(async () => auth)
+    assert.equal(u.windows.find((w) => w.name === "每日登录"), undefined)
+  }, [[/\/account\/points/, () => json(points)], [/\/account\/entitlement/, () => json({ data: { benefits: [{ typeCode: "supabase_count", quota: 1 }] } })]])
+
+  await withFetch(async () => {
+    const u = await hooks.auth.usage(async () => auth)
+    assert.equal(u.windows.find((w) => w.name === "每日登录").display, "不限")
+  }, [[/\/account\/points/, () => json(points)], [/\/account\/entitlement/, () => json({ data: { benefits: [{ typeCode: "daily_login", quota: -1 }] } })]])
+})
+
+test("usage：权益里带今日已发标记时，只在展示上补一句，不做任何领取", async () => {
+  const { hooks } = await plugin(fakeClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, username: "Fishundersea",
+  }
+  const points = { data: { account: { availableBalance: 3200, frozenBalance: 0 } } }
+  const entitlement = {
+    data: {
+      dailyLoginGranted: true,
+      dailyLoginGrantAmount: 2000,
+      benefits: [{ typeCode: "daily_login", typeName: "每日登录赠送积分", quota: 2000, unit: "积分" }],
+    },
+  }
+  await withFetch(async (mock) => {
+    const u = await hooks.auth.usage(async () => auth)
+    assert.deepEqual(u.windows.find((w) => w.name === "每日登录"), { name: "每日登录", display: "2,000 积分/日 · 今日已到账", aside: true })
+    // 只发了两个只读 GET；没有签到/领取类请求
+    assert.ok(mock.calls.every((c) => c.init?.method === undefined || c.init.method === "GET"))
+    assert.equal(mock.calls.length, 2)
+  }, [[/\/account\/points/, () => json(points)], [/\/account\/entitlement/, () => json(entitlement)]])
 })
 
 test("usage：api 账号（手填 AK）读不到积分，明确报错", async () => {

@@ -144,6 +144,23 @@ function soonestLapse(grants) {
   return best
 }
 
+/**
+ * 官方「每日登录赠送积分」的只读视图：从套餐权益里取 `daily_login`。
+ *
+ * 只读取、不代领：按 Meoo 的规则，每日首次登录由服务端发放（pricing.md
+ * 「每日赠送」），插件不在后台模拟登录或调领取接口。权益接口偶尔不可用时
+ * 返回 null，余额卡照常显示。
+ */
+function dailyLoginOf(entitlement) {
+  const benefits = Array.isArray(entitlement?.benefits) ? entitlement.benefits : []
+  const b = benefits.find((x) => x?.typeCode === "daily_login" || x?.typeName === "每日登录赠送积分")
+  if (!b) return null
+  const raw = Math.trunc(Number(b.quota))
+  // -1 在权益里表示「不限」；0 或解析不出来按没有该权益处理。
+  if (!Number.isFinite(raw) || raw === 0) return null
+  return { quota: raw, unit: String(b.unit || "积分") }
+}
+
 // ---- OAuth（Authorization Code + PKCE，public client）----------------------
 
 async function tokenRequest(apiBaseUrl, params) {
@@ -868,7 +885,11 @@ export const MeooAuthPlugin = async ({ client }) => {
         }
         if (auth.type !== "oauth") throw new Error("登录态类型未知，无法读取积分")
         const { a } = await currentAuth(ctx, auth)
-        const data = await controlRequest(ctx, a, "GET", "/open/v1/cli-compat/account/points")
+        // 积分钱包与套餐权益并行读：权益只用于只读展示，接口不可用时不影响余额卡。
+        const [data, entitlement] = await Promise.all([
+          controlRequest(ctx, a, "GET", "/open/v1/cli-compat/account/points"),
+          controlRequest(ctx, a, "GET", "/open/v1/cli-compat/account/entitlement").catch(() => null),
+        ])
         const acc = data?.account || {}
         const left = int(acc.availableBalance)
         const used = int(acc.totalConsumed)
@@ -882,6 +903,14 @@ export const MeooAuthPlugin = async ({ client }) => {
         const windows = [wallet]
         if (used > 0) windows.push({ name: "已用", display: `${fmt(used)} 积分`, aside: true })
         if (frozen > 0) windows.push({ name: "冻结", display: `${fmt(frozen)} 积分`, aside: true })
+        // 官方「每日登录赠送积分」只做只读展示：额度来自套餐权益，是否到账由服务端在
+        // 正常登录时决定；插件不代签、不自动领取。
+        const daily = dailyLoginOf(entitlement)
+        if (daily) {
+          const amount = daily.quota === -1 ? "不限" : `${fmt(daily.quota)} ${daily.unit}/日`
+          const granted = entitlement?.dailyLoginGranted === true ? " · 今日已到账" : ""
+          windows.push({ name: "每日登录", display: `${amount}${granted}`, aside: true })
+        }
         return { user: a.username || "", balance: `${fmt(left)} 积分`, windows }
       },
       async loader(getAuth) {
@@ -958,4 +987,5 @@ export const _internal = {
   clientIdFor,
   apiBaseOf,
   gatewayBase,
+  dailyLoginOf,
 }

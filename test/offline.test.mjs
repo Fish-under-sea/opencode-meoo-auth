@@ -12,6 +12,10 @@ const {
   pickProject,
   resolveServiceAk,
   currentAuth,
+  renewToken: renewTokenInternal,
+  shrinkChatBody,
+  gatewayFetch,
+  bytesOf,
   fetchGatewayModels,
   resetCatalogCache,
   configModels,
@@ -531,7 +535,7 @@ test("loader：api 账号给 baseURL+apiKey；oauth 账号续期后用缓存的 
   const l1 = await hooks.auth.loader(async () => ({ type: "api", key: "meoo_project_service_v1.k" }))
   assert.equal(l1.baseURL, GATEWAY)
   assert.equal(l1.apiKey, "meoo_project_service_v1.k")
-  assert.equal(l1.fetch, undefined)
+  assert.equal(typeof l1.fetch, "function")
 
   const staleAuth = {
     type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-loader",
@@ -580,6 +584,179 @@ test("refresh 钩子：oauth 账号续期并保留 AK/项目字段；api 账号�
     assert.equal(next.apiBase, "https://meoo.test")
     assert.equal(client.saved.length, 1)
   }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+// ---- 续期失败与存回宿主 -----------------------------------------------------
+
+test("auth hook：声明 rotating（Meoo 每次续期都换新的 refresh token）", async () => {
+  // 实测 2026-11：登录时的 refresh token 指纹在一次自动续期后就变了。旧的立刻
+  // 作废，所以这个登录态不能被复制出去并行续期。
+  const { hooks } = await plugin()
+  assert.equal(hooks.auth.rotating, true)
+  assert.equal(typeof hooks.auth.refreshLead, "number")
+})
+
+test("refresh 钩子：invalid_grant 抛 signIn 'expired'，让宿主标记重新登录而不是无限重试", async () => {
+  // 报障场景：Meoo 对已作废的 refresh token 回 HTTP 400 invalid_grant。
+  // 宿主只有读到错误的 signIn:"expired" 才会把账号标为失效并停止退避重试。
+  const { hooks } = await plugin()
+  const auth = { type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-dead", expires: Date.now() - 1000 }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, "expired")
+      assert.equal(e.code, "invalid_grant")
+      assert.match(e.message, /invalid_grant/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400, headers: { "content-type": "application/json" } })]])
+})
+
+test("refresh 钩子：瞬时失败（非 invalid_grant）不标 expired，可退避重试", async () => {
+  const { hooks } = await plugin()
+  const auth = { type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-tmp", expires: Date.now() - 1000 }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, undefined)
+      assert.doesNotMatch(e.message, /invalid_grant/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => new Response("temporary", { status: 500 })]])
+})
+
+/** 一个 auth.set 会失败的 client：模拟宿主写不进 plugin-auth.json。 */
+function failingClient(why = "disk full") {
+  return {
+    saved: [],
+    auth: {
+      async set() {
+        throw new Error(why)
+      },
+      async get() {
+        return { data: undefined }
+      },
+    },
+  }
+}
+
+test("续期后存不回宿主：persistOf 报错并标 expired，不再静默丢凭据", async () => {
+  // 换票成功但 auth.set 抛错：这一代凭据不能当没发生——否则下一次会带已经作废的
+  // 旧 token 去换票，得到 invalid_grant。persistOf 把错误报出来并带 signIn:"expired"。
+  const { hooks } = await plugin(failingClient())
+  const auth = { type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-fail", expires: Date.now() - 1000 }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, "expired")
+      assert.match(e.message, /没能存回宿主/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+// ---- 请求体瘦身（Meoo 网关 1 MiB 硬上限）------------------------------------
+
+test("shrinkChatBody：不超限原引用返回；超限删最旧消息、保留 system 与最后一条", () => {
+  const small = { messages: [{ role: "user", content: "hi" }] }
+  assert.equal(shrinkChatBody(small), small)
+
+  const body = {
+    messages: [
+      { role: "system", content: "你是助手" },
+      { role: "user", content: "第一问".repeat(80) },
+      { role: "assistant", content: "第一答".repeat(80) },
+      { role: "user", content: "最后一问" },
+    ],
+  }
+  const out = shrinkChatBody(body, 200)
+  assert.equal(out.messages[0].role, "system")
+  assert.equal(out.messages.at(-1).content, "最后一问")
+  assert.ok(out.messages.length < body.messages.length, "最旧的非 system 消息应被删掉")
+  assert.ok(bytesOf(out) <= 200, `应压到上限内，实际 ${bytesOf(out)}`)
+})
+
+test("shrinkChatBody：删最旧消息时不留下孤儿 tool 消息", () => {
+  // assistant 带 tool_calls 时，它后面的 tool 结果必须跟着一起删，否则网关会拒绝
+  // 一条没有主人的 tool 消息。
+  const body = {
+    messages: [
+      { role: "system", content: "s" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "工具结果".repeat(300) },
+      { role: "assistant", content: "结论".repeat(300) },
+      { role: "user", content: "final" },
+    ],
+  }
+  const out = shrinkChatBody(body, 200)
+  assert.equal(out.messages.at(-1).content, "final")
+  const hasTool = out.messages.some((m) => m.role === "tool" && m.tool_call_id === "c1")
+  const hasCall = out.messages.some((m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.some((t) => t.id === "c1"))
+  assert.ok(!hasTool || hasCall, "不能留下没有主人的 tool 消息")
+  assert.ok(bytesOf(out) <= 200, `应压到上限内，实际 ${bytesOf(out)}`)
+})
+
+test("shrinkChatBody：超限时去掉非最后一条的图片、保留最后一条图片", () => {
+  const img = "data:image/png;base64," + "A".repeat(400)
+  const body = {
+    messages: [
+      { role: "system", content: "s" },
+      { role: "user", content: [{ type: "text", text: "看这张图" }, { type: "image_url", image_url: { url: img } }] },
+      { role: "user", content: [{ type: "text", text: "再看这张" }, { type: "image_url", image_url: { url: img } }] },
+    ],
+  }
+  // 图片是最大头：历史里的先去掉，最后一条的保留。
+  const out = shrinkChatBody(body, 800)
+  assert.equal(out.messages.length, 3, "三条消息都应保留（图片去掉后已达标）")
+  assert.equal(out.messages[1].content.filter((p) => p.type === "image_url").length, 0, "历史里的图片应被去掉")
+  assert.equal(out.messages[2].content.filter((p) => p.type === "image_url").length, 1, "最后一条的图片应保留")
+  assert.ok(bytesOf(out) <= 800, `应压到上限内，实际 ${bytesOf(out)}`)
+})
+
+test("gatewayFetch：超限 chat 请求发出前压到安全水位", async () => {
+  const enc = new TextEncoder()
+  const sent = []
+  const inner = async (url, init = {}) => {
+    const n = enc.encode(init.body ?? "").length
+    sent.push(n)
+    // 模拟网关：超过 1 MiB 硬上限回 413，否则 200
+    return n > 1_048_000 ? new Response("too large", { status: 413 }) : new Response("ok", { status: 200 })
+  }
+  const prev = globalThis.fetch
+  globalThis.fetch = inner
+  try {
+    const f = gatewayFetch()
+    // 原始 body 约 1.1 MB，超过 900KB 安全水位，也超过 1 MiB 硬上限
+    const big = { model: "m", messages: [{ role: "user", content: "A".repeat(1_100_000) }] }
+    const res = await f("https://gw.test/chat/completions", { method: "POST", body: JSON.stringify(big) })
+    assert.equal(res.status, 200)
+    assert.equal(sent.length, 1, "压到安全水位后一次就该过")
+    assert.ok(sent[0] < 1_000_000, `发出的 body 应压到硬上限内，实际 ${sent[0]}`)
+  } finally {
+    globalThis.fetch = prev
+  }
+})
+
+test("gatewayFetch：网关仍回 413 时再压一轮重试", async () => {
+  const enc = new TextEncoder()
+  const sent = []
+  let calls = 0
+  const inner = async (url, init = {}) => {
+    calls++
+    const n = enc.encode(init.body ?? "").length
+    sent.push(n)
+    // 第一次故意 413（模拟网关更严），第二次放行
+    return calls === 1 ? new Response("too large", { status: 413 }) : new Response("ok", { status: 200 })
+  }
+  const prev = globalThis.fetch
+  globalThis.fetch = inner
+  try {
+    const f = gatewayFetch()
+    const big = { model: "m", messages: [{ role: "user", content: "A".repeat(1_100_000) }] }
+    const res = await f("https://gw.test/chat/completions", { method: "POST", body: JSON.stringify(big) })
+    assert.equal(res.status, 200)
+    assert.equal(sent.length, 2, "第一次 413 后应重试一次")
+    assert.ok(sent[1] < sent[0], "重试的 body 应比第一次更小")
+  } finally {
+    globalThis.fetch = prev
+  }
 })
 
 // ---- 余额（usage）-----------------------------------------------------------

@@ -48,6 +48,12 @@ const CATALOG_TTL_MS = 10 * 60 * 1000
 const CONTEXT_WINDOW = 200_000
 const DEFAULT_MAX_TOKENS = 64_000
 
+// Meoo 网关对单个请求体的硬上限正好 1 MiB（2026-11 实测：1,048,111 B 放行、
+// 1,048,687 B 拒绝）。AI SDK 不知道这个限制，长会话（历史 + 工具输出 + 工具
+// schema）序列化后轻易超过 2 MB，于是 100% 413。这里在请求发出前把 body 压到
+// 安全水位以下，并把 413 当「还要再压一轮」的信号重试一次。
+const MAX_BODY_BYTES = 900 * 1024
+
 /**
  * 模型规格表。网关 /models 只回裸 id，不带上下文/输出上限，所以数字得自己带。
  * 取值来自各家官方文档（2026-11 核对）：
@@ -175,7 +181,18 @@ async function tokenRequest(apiBaseUrl, params) {
   try {
     json = JSON.parse(text)
   } catch {}
-  if (!res.ok) throw new Error(`OAuth 换票失败 HTTP ${res.status}: ${json.error || text.slice(0, 160)}`)
+  if (!res.ok) {
+    const err = new Error(`OAuth 换票失败 HTTP ${res.status}: ${json.error || text.slice(0, 160)}`)
+    if (json.error) err.code = json.error
+    // invalid_grant 是 OAuth 的终态：refresh token 已被作废，重试也不会好。
+    // 宿主读到 signIn:"expired" 会把账号标为需要重新登录并停止退避重试，
+    // 否则它会照着一次失败继续按退避重试一个已经死掉的 token。
+    if (json.error === "invalid_grant" || (!json.error && res.status === 400 && /invalid_grant/.test(text))) {
+      err.signIn = "expired"
+      err.code = "invalid_grant"
+    }
+    throw err
+  }
   return json
 }
 
@@ -203,6 +220,7 @@ async function renewToken(a, save) {
   const key = a.refresh
   const done = renewed.get(key)
   if (done && Date.now() - done.at < KEEP_RENEWED_MS) {
+    // 这一代已经在缓存里（换票那趟存过一次），把它存回宿主
     const merged = { ...a, ...done.next }
     await save?.(merged)
     return merged
@@ -211,15 +229,19 @@ async function renewToken(a, save) {
   if (!r) {
     r = (async () => {
       const next = await callRefreshApi(a)
+      // 存成功之后才放进缓存：Meoo 的 refresh token 每次续期都换新的，旧的
+      // 立刻作废，所以这一代 token 只有一份。存回宿主失败时（persistOf 会
+      // 抛），若这里已经缓存了它，缓存过期后这一代就彻底丢了——下一次续期会
+      // 带着已经作废的旧 token，得到 invalid_grant，看起来和「服务端吊销」一样。
+      await save?.({ ...a, ...next })
       renewed.set(key, { next, at: Date.now() })
       return next
     })().finally(() => renewing.delete(key))
     renewing.set(key, r)
   }
+  // 换票那一趟已经存过；走到这里的都是等同一个并发续期的调用方，不必再存。
   const next = await r
-  const merged = { ...a, ...next }
-  await save?.(merged)
-  return merged
+  return { ...a, ...next }
 }
 
 // Meoo 的 access token 过期时间是登录/续期时给的 expires_in，不是 JWT 声明；
@@ -403,7 +425,11 @@ async function serviceAkOf(ctx, a) {
   const urlId = await pickProject(ctx, a)
   if (a?.serviceAk && a.serviceAkProjectId === urlId) return a.serviceAk
   const { urlId: resolved, ak } = await resolveServiceAk(ctx, a, { projectUrlId: urlId })
-  await persistOf(ctx)({ ...a, projectUrlId: resolved, serviceAk: ak, serviceAkProjectId: resolved })
+  // 这里存的是 AK 不是换来的 token：存不住只是下次要再解析一次，这一趟已经
+  // 拿到 AK 了，所以不让它把整个操作拖垮。token 那边的存不住是致命的，那边不吞。
+  try {
+    await persistOf(ctx)({ ...a, projectUrlId: resolved, serviceAk: ak, serviceAkProjectId: resolved })
+  } catch {}
   return ak
 }
 
@@ -815,11 +841,181 @@ function manualKeySignIn() {
 
 // ---- 插件出口 ---------------------------------------------------------------
 
+/**
+ * 把更新后的账号记录存回宿主。
+ *
+ * 存不回是致命的，不能吞掉：Meoo 的 refresh token 每次续期都换新的，旧的立刻
+ * 作废（实测 2026-11）。续期成功但没存回去，下一次就会带着已经作废的 token 去
+ * 换票，拿到 HTTP 400 invalid_grant，而这次失败看起来和「token 被服务端吊销」
+ * 一模一样，很难分辨。所以这里把失败报出去，让宿主和日志知道凭据没落盘。
+ *
+ * 宿主没有「这个账号已经登出了」的办法告诉插件（auth.set 在账号被登出时照样
+ * 返回成功），所以这里只能把写入本身抛出来的错误报出去：磁盘写不进去时宿主
+ * 会抛，那才是真正丢凭据的情况。账号被登出时宿主不抛，插件也就跟着不报错，
+ * 那是本来的结果。
+ */
 function persistOf(ctx) {
   return async (updated) => {
     try {
       await ctx?.client?.auth?.set?.({ path: { id: PROVIDER_ID }, body: updated })
+    } catch (e) {
+      const err = new Error(
+        `Meoo 登录态没能存回宿主（换到的凭据可能已经作废，请重新登录）：${e?.message ?? e}`,
+      )
+      err.cause = e
+      // 存不回凭据和凭据被拒一样，再试一次也没用
+      err.signIn = "expired"
+      throw err
+    }
+  }
+}
+
+// ---- 请求体瘦身（Meoo 网关 1 MiB 硬上限）----------------------------------
+
+const SHRINK_NOTE = "…[Meoo 网关单请求上限，中间已省略]…"
+const IMAGE_OMIT_NOTE = "[图片已省略：Meoo 网关请求体上限]"
+const utf8 = new TextEncoder()
+
+function bytesOf(v) {
+  return utf8.encode(JSON.stringify(v ?? null)).length
+}
+
+function textLenOf(content) {
+  if (typeof content === "string") return content.length
+  if (Array.isArray(content)) return content.reduce((n, p) => n + (p && typeof p === "object" && typeof p.text === "string" ? p.text.length : 0), 0)
+  return 0
+}
+
+function truncateText(s, maxChars) {
+  if (typeof s !== "string" || s.length <= maxChars) return s
+  if (maxChars <= SHRINK_NOTE.length + 2) return s.slice(0, Math.max(0, maxChars))
+  const tail = Math.max(0, Math.floor((maxChars - SHRINK_NOTE.length) * 0.4))
+  const head = maxChars - SHRINK_NOTE.length - tail
+  return s.slice(0, head) + SHRINK_NOTE + s.slice(-tail)
+}
+
+function truncateContent(content, maxChars) {
+  if (typeof content === "string") return truncateText(content, maxChars)
+  if (Array.isArray(content)) {
+    return content.map((p) => (p && typeof p === "object" && typeof p.text === "string" ? { ...p, text: truncateText(p.text, maxChars) } : p))
+  }
+  return content
+}
+
+const imagePart = (p) => p && typeof p === "object" && (p.type === "image_url" || p.type === "image")
+
+const blankContent = (content) => {
+  if (typeof content === "string") return ""
+  if (Array.isArray(content)) return content.map((p) => (p && typeof p === "object" && typeof p.text === "string" ? { ...p, text: "" } : p))
+  return content
+}
+
+function stripImages(content) {
+  if (!Array.isArray(content)) return content
+  const parts = content.filter((p) => !imagePart(p))
+  if (parts.length === content.length) return content
+  if (!parts.length) return [{ type: "text", text: IMAGE_OMIT_NOTE }]
+  return parts
+}
+
+/**
+ * 把一个 OpenAI 聊天请求体压到 limit 字节以内，只动 messages、不动 tools 等
+ * 其余字段（工具定义必须保留，否则 function calling 失效）。按破坏性从小到大：
+ *  1. 去掉除最后一条以外消息里的图片（历史里的图通常是最占地方、也最不必要）；
+ *  2. 逐条截断最长的文本（工具输出/长正文），保留头尾；
+ *  3. 删掉最旧的非 system 消息（assistant 带 tool_calls 时连同它的 tool 结果
+ *     一起删，避免留下没有主人的 tool 消息）；
+ *  4. 连最后一条的图片也去掉（保留文字）；
+ *  5. 兜底：所有保留消息的文本压到一个小上限。
+ * 每一步之后只要达标就返回。
+ */
+function shrinkChatBody(body, limit = MAX_BODY_BYTES) {
+  if (!body || typeof body !== "object") return body
+  if (!Array.isArray(body.messages) || !body.messages.length) return body
+  if (bytesOf(body) <= limit) return body
+
+  const headCount = body.messages[0]?.role === "system" ? 1 : 0
+  let messages = body.messages.slice()
+
+  // 1) 去掉除最后一条以外消息里的图片
+  messages = messages.map((m, i) => (i === messages.length - 1 ? m : { ...m, content: stripImages(m.content) }))
+  let out = { ...body, messages }
+  if (bytesOf(out) <= limit) return out
+
+  // 2) 逐条截断最长的文本（工具输出/长正文）
+  for (let pass = 0; pass < 10; pass++) {
+    const size = bytesOf(out)
+    if (size <= limit) return out
+    let big = null
+    for (let i = 0; i < messages.length; i++) {
+      const n = textLenOf(messages[i].content)
+      if (!big || n > big.n) big = { i, n }
+    }
+    if (!big || big.n < 64) break
+    messages = messages.map((m, i) => (i === big.i ? { ...m, content: truncateContent(m.content, Math.floor(big.n / 2)) } : m))
+    out = { ...body, messages }
+  }
+  if (bytesOf(out) <= limit) return out
+
+  // 3) 删最旧的非 system 消息，最新一条永远保留
+  const dropOldest = () => {
+    const dropped = messages[headCount]
+    let end = headCount + 1
+    if (dropped?.role === "assistant" && Array.isArray(dropped.tool_calls) && dropped.tool_calls.length) {
+      const ids = new Set(dropped.tool_calls.map((t) => t?.id).filter(Boolean))
+      while (end < messages.length && messages[end]?.role === "tool" && ids.has(messages[end]?.tool_call_id)) end++
+    }
+    messages = [...messages.slice(0, headCount), ...messages.slice(end)]
+  }
+  while (messages.length > headCount + 1 && bytesOf({ ...body, messages }) > limit) dropOldest()
+  out = { ...body, messages }
+  if (bytesOf(out) <= limit) return out
+
+  // 4) 连最后一条的图片也去掉（保留文字）
+  messages = messages.map((m, i) => (i === messages.length - 1 ? { ...m, content: stripImages(m.content) } : m))
+  out = { ...body, messages }
+  if (bytesOf(out) <= limit) return out
+
+  // 5) 兜底：按剩余预算截断所有文本。UTF-8 一个字符最多 4 字节，按 4 字节/字符
+  // 估一个每段上限，并保留消息内容的结构（空文本替代），保证 JSON 序列化后一定
+  // 落在 limit 以内。
+  const empty = { ...body, messages: messages.map((m) => ({ ...m, content: blankContent(m.content) })) }
+  const textBudget = Math.max(0, limit - bytesOf(empty))
+  const nParts = messages.reduce((n, m) => n + (Array.isArray(m.content) ? Math.max(1, m.content.length) : 1), 0)
+  const perPart = Math.max(1, Math.floor(textBudget / Math.max(nParts, 1) / 4))
+  messages = messages.map((m) => ({ ...m, content: truncateContent(m.content, perPart) }))
+  return { ...body, messages }
+}
+
+/**
+ * 包一层 fetch：发往网关 /chat/completions 的请求在发出前按字节数压到安全水位，
+ * 仍被 413 时再压一轮重试一次。其它请求（/models、换票、控制面等）原样转发。
+ */
+function gatewayFetch() {
+  return async (input, init = {}) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url ?? String(input)
+    if (!url.includes("/chat/completions") || typeof init.body !== "string") return fetch(url, init)
+
+    let body = init.body
+    try {
+      const parsed = JSON.parse(body)
+      if (bytesOf(parsed) > MAX_BODY_BYTES) body = JSON.stringify(shrinkChatBody(parsed))
     } catch {}
+
+    const res = await fetch(url, { ...init, body })
+    if (res.status !== 413) return res
+    // 已经压过还是 413：网关对这份内容仍不收，再压到一半重试一次。
+    try {
+      const parsed = JSON.parse(body)
+      const smaller = shrinkChatBody(parsed, Math.floor(MAX_BODY_BYTES / 2))
+      if (bytesOf(smaller) >= bytesOf(parsed)) return res
+      try {
+        await res.body?.cancel?.()
+      } catch {}
+      return await fetch(url, { ...init, body: JSON.stringify(smaller) })
+    } catch {
+      return res
+    }
   }
 }
 
@@ -860,6 +1056,12 @@ export const MeooAuthPlugin = async ({ client }) => {
     auth: {
       provider: PROVIDER_ID,
       refreshLead: LEAD_MS,
+      // Meoo 每次续期都换一个新的 refresh token，旧的立刻作废（实测 2026-11：
+      // 登录时的指纹在一次自动续期后就变了）。所以这个登录态不能被复制到另一台
+      // 机器或另一个进程去并行续期——两个主人抢一个一次性 token，输的那个拿到
+      // HTTP 400 invalid_grant，且无法自愈。宿主读到 rotating: true 就不会把它
+      // 带去同步或备份（magpie-community/plugins#884）。
+      rotating: true,
       async refresh(auth) {
         if (auth?.type !== "oauth" || !auth.refresh) return undefined
         const { a, didRenew } = await currentAuth(ctx, auth, true)
@@ -915,13 +1117,13 @@ export const MeooAuthPlugin = async ({ client }) => {
       },
       async loader(getAuth) {
         const auth = await getAuth()
-        if (auth?.type === "api") return auth.key ? { baseURL: gatewayBase(), apiKey: auth.key } : {}
+        if (auth?.type === "api") return auth.key ? { baseURL: gatewayBase(), apiKey: auth.key, fetch: gatewayFetch() } : {}
         if (auth?.type !== "oauth") return {}
         try {
           const { a } = await currentAuth(ctx, auth)
           const ak = a.serviceAk || (await serviceAkOf(ctx, a))
           if (!ak) return {}
-          return { baseURL: gatewayBase(), apiKey: ak }
+          return { baseURL: gatewayBase(), apiKey: ak, fetch: gatewayFetch() }
         } catch (e) {
           const expired = e?.signIn === "expired"
           return {
@@ -988,4 +1190,7 @@ export const _internal = {
   apiBaseOf,
   gatewayBase,
   dailyLoginOf,
+  shrinkChatBody,
+  gatewayFetch,
+  bytesOf,
 }

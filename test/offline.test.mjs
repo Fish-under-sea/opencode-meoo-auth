@@ -12,6 +12,10 @@ const {
   pickProject,
   resolveServiceAk,
   currentAuth,
+  renewToken: renewTokenInternal,
+  shrinkChatBody,
+  gatewayFetch,
+  bytesOf,
   fetchGatewayModels,
   resetCatalogCache,
   configModels,
@@ -531,7 +535,7 @@ test("loader：api 账号给 baseURL+apiKey；oauth 账号续期后用缓存的 
   const l1 = await hooks.auth.loader(async () => ({ type: "api", key: "meoo_project_service_v1.k" }))
   assert.equal(l1.baseURL, GATEWAY)
   assert.equal(l1.apiKey, "meoo_project_service_v1.k")
-  assert.equal(l1.fetch, undefined)
+  assert.equal(typeof l1.fetch, "function")
 
   const staleAuth = {
     type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-loader",
@@ -582,6 +586,222 @@ test("refresh 钩子：oauth 账号续期并保留 AK/项目字段；api 账号�
   }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
 })
 
+// ---- 续期失败与存回宿主 -----------------------------------------------------
+
+test("auth hook：声明 rotating（Meoo 每次续期都换新的 refresh token）", async () => {
+  // 实测 2026-11：登录时的 refresh token 指纹在一次自动续期后就变了。旧的立刻
+  // 作废，所以这个登录态不能被复制出去并行续期。
+  const { hooks } = await plugin()
+  assert.equal(hooks.auth.rotating, true)
+  assert.equal(typeof hooks.auth.refreshLead, "number")
+})
+
+test("refresh 钩子：invalid_grant 抛 signIn 'expired'，让宿主标记重新登录而不是无限重试", async () => {
+  // 报障场景：Meoo 对已作废的 refresh token 回 HTTP 400 invalid_grant。
+  // 宿主只有读到错误的 signIn:"expired" 才会把账号标为失效并停止退避重试。
+  const { hooks } = await plugin()
+  const auth = { type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-dead", expires: Date.now() - 1000 }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, "expired")
+      assert.equal(e.code, "invalid_grant")
+      assert.match(e.message, /invalid_grant/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400, headers: { "content-type": "application/json" } })]])
+})
+
+test("refresh 钩子：瞬时失败（非 invalid_grant）不标 expired，可退避重试", async () => {
+  const { hooks } = await plugin()
+  const auth = { type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-tmp", expires: Date.now() - 1000 }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, undefined)
+      assert.doesNotMatch(e.message, /invalid_grant/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => new Response("temporary", { status: 500 })]])
+})
+
+/** 一个 auth.set 会失败的 client：模拟宿主写不进 plugin-auth.json。 */
+function failingClient(why = "disk full") {
+  return {
+    saved: [],
+    auth: {
+      async set() {
+        throw new Error(why)
+      },
+      async get() {
+        return { data: undefined }
+      },
+    },
+  }
+}
+
+test("续期后存不回宿主：persistOf 报错并标 expired，不再静默丢凭据", async () => {
+  // 换票成功但 auth.set 抛错：这一代凭据不能当没发生——否则下一次会带已经作废的
+  // 旧 token 去换票，得到 invalid_grant。persistOf 把错误报出来并带 signIn:"expired"。
+  const { hooks } = await plugin(failingClient())
+  const auth = { type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-fail", expires: Date.now() - 1000 }
+  await withFetch(async () => {
+    await assert.rejects(() => hooks.auth.refresh(auth), (e) => {
+      assert.equal(e.signIn, "expired")
+      assert.match(e.message, /没能存回宿主/)
+      return true
+    })
+  }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+test("续期后存不回宿主：这一代 token 不进缓存，再续一次会重新换票", async () => {
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-old", refresh: "ref-nostore2",
+    expires: Date.now() - 1000,
+  }
+  await withFetch(async (fetchMock) => {
+    // 第一次：换票成功，但存不回宿主
+    await assert.rejects(() => renewTokenInternal(auth, async () => {
+      throw new Error("no space left on device")
+    }))
+    // 第二次（60 秒缓存期内）：如果没落盘的那一代被缓存了，这里会直接拿缓存、
+    // 不再换票，并假装成功。正确的行为是不信任它，重新走一次换票。
+    const saved = []
+    await renewTokenInternal(auth, async (merged) => {
+      saved.push(merged)
+    })
+    const tokenCalls = fetchMock.calls.filter((c) => c.url.endsWith("/oauth/token"))
+    assert.equal(tokenCalls.length, 2, "存不回宿主的那一代不能被缓存复用")
+    assert.equal(saved.length, 1)
+  }, [[/\/oauth\/token/, () => json(OK_TOKEN)]])
+})
+
+test("解析出的 AK 存不回宿主时不拖垮这次操作（AK 已经在手上）", async () => {
+  const { hooks } = await plugin(failingClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, projectUrlId: "proj-a",
+  }
+  await withFetch(async () => {
+    // AK 已经解析出来并能用，存不住只是下次要再解析一次，不该报错
+    const l = await hooks.auth.loader(async () => auth)
+    assert.equal(l.apiKey, "meoo_project_service_v1.env")
+  }, [
+    [/\/cloud\/environment/, () => json({ data: { meooProjectApiKey: "meoo_project_service_v1.env" } })],
+  ])
+})
+
+// ---- 请求体瘦身（Meoo 网关 1 MiB 硬上限）------------------------------------
+
+test("shrinkChatBody：不超限原引用返回；超限删最旧消息、保留 system 与最后一条", () => {
+  const small = { messages: [{ role: "user", content: "hi" }] }
+  assert.equal(shrinkChatBody(small), small)
+
+  const body = {
+    messages: [
+      { role: "system", content: "你是助手" },
+      { role: "user", content: "第一问".repeat(80) },
+      { role: "assistant", content: "第一答".repeat(80) },
+      { role: "user", content: "最后一问" },
+    ],
+  }
+  const out = shrinkChatBody(body, 200)
+  assert.equal(out.messages[0].role, "system")
+  assert.equal(out.messages.at(-1).content, "最后一问")
+  assert.ok(out.messages.length < body.messages.length, "最旧的非 system 消息应被删掉")
+  assert.ok(bytesOf(out) <= 200, `应压到上限内，实际 ${bytesOf(out)}`)
+})
+
+test("shrinkChatBody：删最旧消息时不留下孤儿 tool 消息", () => {
+  // assistant 带 tool_calls 时，它后面的 tool 结果必须跟着一起删，否则网关会拒绝
+  // 一条没有主人的 tool 消息。
+  const body = {
+    messages: [
+      { role: "system", content: "s" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "工具结果".repeat(300) },
+      { role: "assistant", content: "结论".repeat(300) },
+      { role: "user", content: "final" },
+    ],
+  }
+  const out = shrinkChatBody(body, 200)
+  assert.equal(out.messages.at(-1).content, "final")
+  const hasTool = out.messages.some((m) => m.role === "tool" && m.tool_call_id === "c1")
+  const hasCall = out.messages.some((m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.some((t) => t.id === "c1"))
+  assert.ok(!hasTool || hasCall, "不能留下没有主人的 tool 消息")
+  assert.ok(bytesOf(out) <= 200, `应压到上限内，实际 ${bytesOf(out)}`)
+})
+
+test("shrinkChatBody：超限时去掉非最后一条的图片、保留最后一条图片", () => {
+  const img = "data:image/png;base64," + "A".repeat(400)
+  const body = {
+    messages: [
+      { role: "system", content: "s" },
+      { role: "user", content: [{ type: "text", text: "看这张图" }, { type: "image_url", image_url: { url: img } }] },
+      { role: "user", content: [{ type: "text", text: "再看这张" }, { type: "image_url", image_url: { url: img } }] },
+    ],
+  }
+  // 图片是最大头：历史里的先去掉，最后一条的保留。
+  const out = shrinkChatBody(body, 800)
+  assert.equal(out.messages.length, 3, "三条消息都应保留（图片去掉后已达标）")
+  assert.equal(out.messages[1].content.filter((p) => p.type === "image_url").length, 0, "历史里的图片应被去掉")
+  assert.equal(out.messages[2].content.filter((p) => p.type === "image_url").length, 1, "最后一条的图片应保留")
+  assert.ok(bytesOf(out) <= 800, `应压到上限内，实际 ${bytesOf(out)}`)
+})
+
+test("gatewayFetch：超限 chat 请求发出前压到安全水位", async () => {
+  const enc = new TextEncoder()
+  const sent = []
+  const inner = async (url, init = {}) => {
+    const n = enc.encode(init.body ?? "").length
+    sent.push(n)
+    // 模拟网关：超过 1 MiB 硬上限回 413，否则 200
+    return n > 1_048_000 ? new Response("too large", { status: 413 }) : new Response("ok", { status: 200 })
+  }
+  const prev = globalThis.fetch
+  globalThis.fetch = inner
+  try {
+    const f = gatewayFetch()
+    // 原始 body 约 1.1 MB，超过 900KB 安全水位，也超过 1 MiB 硬上限
+    const big = { model: "m", messages: [{ role: "user", content: "A".repeat(1_100_000) }] }
+    const res = await f("https://gw.test/chat/completions", { method: "POST", body: JSON.stringify(big) })
+    assert.equal(res.status, 200)
+    assert.equal(sent.length, 1, "压到安全水位后一次就该过")
+    assert.ok(sent[0] < 1_000_000, `发出的 body 应压到硬上限内，实际 ${sent[0]}`)
+  } finally {
+    globalThis.fetch = prev
+  }
+})
+
+test("gatewayFetch：网关仍回 413 时再压一轮重试", async () => {
+  const enc = new TextEncoder()
+  const sent = []
+  let calls = 0
+  const inner = async (url, init = {}) => {
+    calls++
+    const n = enc.encode(init.body ?? "").length
+    sent.push(n)
+    // 第一次故意 413（模拟网关更严），第二次放行
+    return calls === 1 ? new Response("too large", { status: 413 }) : new Response("ok", { status: 200 })
+  }
+  const prev = globalThis.fetch
+  globalThis.fetch = inner
+  try {
+    const f = gatewayFetch()
+    const big = {
+      model: "m",
+      messages: Array.from({ length: 20 }, (_, i) => ({
+        role: "user",
+        content: String.fromCharCode(65 + (i % 26)).repeat(100_000),
+      })),
+    }
+    const res = await f("https://gw.test/chat/completions", { method: "POST", body: JSON.stringify(big) })
+    assert.equal(res.status, 200)
+    assert.equal(sent.length, 2, "第一次 413 后应重试一次")
+    assert.ok(sent[1] < sent[0], "重试的 body 应比第一次更小")
+  } finally {
+    globalThis.fetch = prev
+  }
+})
+
 // ---- 余额（usage）-----------------------------------------------------------
 
 test("dailyLoginOf：按 typeCode/typeName 找权益；0 或缺失不算；-1 表示不限", () => {
@@ -595,7 +815,95 @@ test("dailyLoginOf：按 typeCode/typeName 找权益；0 或缺失不算；-1 �
   assert.equal(dailyLoginOf(null), null)
 })
 
-test("usage：积分按钱包窗口给出（余额/已用/最近到期），权益只读展示每日登录", async () => {
+test("usage：按赠送来源给出带进度条的数量窗口（不再重复一条钱包窗口）", async () => {
+  const { hooks } = await plugin(fakeClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, username: "Fishundersea",
+  }
+  const points = {
+    data: {
+      account: { availableBalance: 11228, frozenBalance: 0, totalGranted: 12000, totalConsumed: 772, totalExpired: 0 },
+      activeGrants: [
+        {
+          sourceType: "SUBSCRIPTION", sourceTypeName: "订阅赠送积分",
+          totalInitialAmount: 5000, totalRemainingAmount: 5000,
+          grantDetails: [{ remainingAmount: 5000, effectiveDate: "2026-11-13T00:00:00", expiresDate: "2026-12-13T00:00:00" }],
+        },
+        {
+          sourceType: "DAILY_LOGIN", sourceTypeName: "登录赠送积分",
+          totalInitialAmount: 2000, totalRemainingAmount: 1228,
+          grantDetails: [{ remainingAmount: 1228, effectiveDate: "2026-11-13T09:02:46.937", expiresDate: "2026-11-19T23:59:59" }],
+        },
+        {
+          sourceType: "INVITE_REWARD", sourceTypeName: "邀请奖励积分",
+          totalInitialAmount: 5000, totalRemainingAmount: 5000,
+          grantDetails: [{ remainingAmount: 5000, expiresDate: "2026-12-13T23:59:59" }],
+        },
+      ],
+    },
+  }
+  await withFetch(async (mock) => {
+    const u = await hooks.auth.usage(async () => auth)
+    assert.equal(u.user, "Fishundersea")
+    assert.equal(u.balance, "11,228 积分")
+    // 不再有「积分」钱包窗口：余额只由顶层 balance 显示一次
+    assert.equal(u.windows.length, 3)
+    assert.ok(u.windows.every((w) => w.name !== "积分" && w.balance === undefined))
+    // 每个赠送来源一条数量窗口：limit/amount/used 齐全，宿主才画进度条
+    const [sub, login, invite] = u.windows
+    assert.deepEqual(sub, {
+      name: "订阅赠送积分", used: 0, amount: 0, limit: 5000, unit: "积分",
+      display: "剩 5,000 / 5,000 积分", runsOutAt: "2026-12-13", runsOut: 5000,
+    })
+    assert.equal(login.name, "登录赠送积分")
+    assert.equal(login.amount, 772)
+    assert.equal(login.limit, 2000)
+    assert.equal(login.display, "剩 1,228 / 2,000 积分")
+    assert.ok(Math.abs(login.used - 38.6) < 1e-9)
+    assert.equal(login.runsOutAt, "2026-11-19")
+    assert.equal(login.runsOut, 1228)
+    assert.equal(invite.name, "邀请奖励积分")
+    // 各来源总量之和 = 发放总量，剩余之和 = 账户余额
+    assert.equal(sub.limit + login.limit + invite.limit, 12000)
+    assert.equal(sub.amount + login.amount + invite.amount + 11228, 12000)
+    assert.equal(u.plan, "个人版")
+    const call = mock.calls.find((c) => c.url.includes("/account/points"))
+    assert.equal(call.init.headers.authorization, "Bearer acc-1")
+  }, [[/\/account\/points/, () => json(points)], [/\/account\/identity/, () => json({ data: { edition: "personal" } })]])
+})
+
+test("usage：runsOut 取最早作废那一笔的剩余量", async () => {
+  const { hooks } = await plugin(fakeClient())
+  const auth = {
+    type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
+    expires: Date.now() + 3600_000, username: "Fishundersea",
+  }
+  const points = {
+    data: {
+      account: { availableBalance: 1000, frozenBalance: 0, totalGranted: 1000, totalConsumed: 0 },
+      activeGrants: [
+        {
+          sourceType: "SUBSCRIPTION", sourceTypeName: "订阅赠送积分",
+          totalInitialAmount: 1000, totalRemainingAmount: 1000,
+          grantDetails: [
+            { remainingAmount: 300, expiresDate: "2026-11-20T00:00:00" },
+            { remainingAmount: 700, expiresDate: "2026-12-01T00:00:00" },
+          ],
+        },
+      ],
+    },
+  }
+  await withFetch(async () => {
+    const u = await hooks.auth.usage(async () => auth)
+    const row = u.windows[0]
+    assert.equal(row.runsOutAt, "2026-11-20")
+    assert.equal(row.runsOut, 300)
+    assert.equal(row.display, "剩 1,000 / 1,000 积分")
+  }, [[/\/account\/points/, () => json(points)]])
+})
+
+test("usage：没有批次明细时退回聚合用量窗口", async () => {
   const { hooks } = await plugin(fakeClient())
   const auth = {
     type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
@@ -604,42 +912,19 @@ test("usage：积分按钱包窗口给出（余额/已用/最近到期），权�
   const points = {
     data: {
       account: { availableBalance: 58848, frozenBalance: 0, totalGranted: 65000, totalConsumed: 2152 },
-      activeGrants: [
-        { grantDetails: [{ remainingAmount: 5000, expiresDate: "2026-12-02T23:59:59" }] },
-        {
-          grantDetails: [
-            { remainingAmount: 1933, expiresDate: "2026-11-10T23:59:59" },
-            { remainingAmount: 0, expiresDate: "2026-11-01T23:59:59" },
-          ],
-        },
-      ],
+      activeGrants: [],
     },
   }
-  const entitlement = {
-    data: {
-      planCode: "free",
-      benefits: [
-        { typeCode: "daily_login", typeName: "每日登录赠送积分", valueType: "LIMIT", quota: 2000, used: 0, unit: "积分" },
-        { typeCode: "supabase_count", typeName: "云服务数量", quota: 1, used: 0 },
-      ],
-    },
-  }
-  await withFetch(async (mock) => {
+  await withFetch(async () => {
     const u = await hooks.auth.usage(async () => auth)
-    assert.equal(u.user, "Fishundersea")
-    assert.equal(u.balance, "58,848 积分")
-    // 钱包窗口：balance + unit（新宿主），同时带 display（旧宿主当纯文本窗口）
-    assert.deepEqual(u.windows[0], { name: "积分", balance: 58848, unit: "积分", display: "58,848 积分", runsOutAt: "2026-11-10" })
-    assert.equal(u.windows[1].name, "已用")
-    assert.equal(u.windows[1].display, "2,152 积分")
-    assert.equal(u.windows[1].aside, true)
-    // 每日登录是只读权益，不是用量；未带「今日已到账」标记时只显示额度
-    assert.deepEqual(u.windows.find((w) => w.name === "每日登录"), { name: "每日登录", display: "2,000 积分/日", aside: true })
-    const call = mock.calls.find((c) => c.url.includes("/account/points"))
-    assert.equal(call.init.headers.authorization, "Bearer acc-1")
-    const ent = mock.calls.find((c) => c.url.includes("/account/entitlement"))
-    assert.equal(ent.init.headers.authorization, "Bearer acc-1")
-  }, [[/\/account\/points/, () => json(points)], [/\/account\/entitlement/, () => json(entitlement)]])
+    assert.equal(u.windows.length, 1)
+    const bar = u.windows[0]
+    assert.equal(bar.name, "积分用量")
+    assert.equal(bar.amount, 2152)
+    assert.equal(bar.limit, 58848 + 2152)
+    assert.equal(bar.display, "2,152 / 61,000 积分")
+    assert.ok(Math.abs(bar.used - (2152 / 61000) * 100) < 1e-9)
+  }, [[/\/account\/points/, () => json(points)]])
 })
 
 test("usage：权益接口不可用时余额卡照常，不显示每日登录窗口", async () => {
